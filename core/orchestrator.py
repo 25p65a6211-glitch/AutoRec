@@ -15,7 +15,8 @@ class ReconOrchestrator:
         self.results = {}
         self.scan_thread = None
         self.is_running = False
-        self.logger = logging.getLogger("auto_recon.orchestrator")
+        self._stop_event = threading.Event()
+        self.logger = logging.getLogger("ReconOrchestrator")
 
     def _log(self, message: str, level: str = "info"):
         level_name = str(level).lower()
@@ -37,26 +38,23 @@ class ReconOrchestrator:
         }
 
         prefix = prefix_map.get(level_name, "[+]")
+        queue_message = f"{prefix} {message}"
 
         if self.ui_queue is not None:
             try:
-                self.ui_queue.put(f"{prefix} {message}")
+                self.ui_queue.put(queue_message)
             except Exception:
                 pass
 
-        self.logger.log(log_map.get(level_name, logging.INFO), "%s %s", prefix, message)
+        self.logger.log(log_map.get(level_name, logging.INFO), queue_message)
 
     def start_scan(self, domain: str, ip: str, profile: str = "Quick") -> bool:
         if self.is_running:
-            if self.ui_queue is not None:
-                try:
-                    self.ui_queue.put("[-] Scan already in progress")
-                except Exception:
-                    pass
-            self.logger.error("Scan already in progress")
+            self._log("Scan already in progress", "error")
             return False
 
         self.is_running = True
+        self._stop_event.clear()
         self.results = {}
         self.scan_thread = threading.Thread(
             target=self._run_modules,
@@ -68,87 +66,128 @@ class ReconOrchestrator:
         return True
 
     def _run_modules(self, domain: str, ip: str, profile: str):
-        start_time = datetime.datetime.now()
-        self.results["metadata"] = {
-            "domain": domain,
-            "ip": ip,
-            "profile": profile,
-            "started_at": start_time.isoformat(),
-        }
-
-        self._log(f"Starting recon workflow for {domain}", "status")
-
         try:
-            dns_result = self._safe_run_module("DNS Recon", lambda: dns_recon.run(domain))
-            self.results["dns"] = dns_result
+            self._log(f"[*] Starting DNS recon for {domain}", "status")
+            dns_result = dns_recon.run(domain)
+            self.results["dns_recon"] = dns_result
+            self._log("[+] DNS recon complete", "info")
 
-            if not dns_result.get("success", False):
-                self._log("DNS recon did not complete successfully; continuing with remaining checks.", "warning")
+            if self._stop_event.is_set():
+                self._log("[~] Scan stop requested — finishing current module", "warning")
+                return
 
-            network_result = self._safe_run_module(
-                "Network Scan",
-                lambda: network_scan.run(ip, profile=profile),
+            self._log(f"[+] Web recon complete — tech stack and WHOIS retrieved", "info")
+            web_result = web_recon.get_web_summary(f"https://{domain}", domain)
+            self.results["web_recon"] = web_result
+
+            if self._stop_event.is_set():
+                self._log("[~] Scan stop requested — finishing current module", "warning")
+                return
+
+            emails = []
+            js_files = []
+            js_findings = []
+
+            sensitive_data = data_extract.extract_sensitive_data(f"https://{domain}")
+            http_headers_result = data_extract.get_http_headers(f"https://{domain}")
+            security_headers = data_extract.check_security_headers(http_headers_result)
+
+            if isinstance(sensitive_data, dict):
+                emails = sensitive_data.get("emails", [])
+                js_files = sensitive_data.get("js_files", [])
+
+            if isinstance(http_headers_result, dict):
+                if "http_headers" in http_headers_result:
+                    http_headers_result = http_headers_result["http_headers"]
+
+            for js_url in js_files:
+                try:
+                    findings = data_extract.analyze_js_file(js_url)
+                    if findings:
+                        js_findings.extend(findings)
+                except Exception as exc:
+                    self._log(f"[-] JS file analysis failed for {js_url}: {exc}", "error")
+
+            self.results["data_extract"] = {
+                "emails": emails,
+                "js_files": js_files,
+                "http_headers": http_headers_result,
+                "security_headers": security_headers,
+                "js_findings": js_findings,
+            }
+            self._log(f"[+] Data extraction complete — {len(emails)} emails, {len(js_findings)} JS findings", "info")
+
+            if profile == "Full":
+                if ip is not None:
+                    network_result = network_scan.get_network_summary(ip)
+                    self.results["network_scan"] = network_result
+                    open_ports = network_result.get("open_ports", []) if isinstance(network_result, dict) else []
+                    self._log(f"[+] Network scan complete — {len(open_ports)} open ports found", "info")
+                else:
+                    self._log("[~] Skipping network scan — no IP resolved", "warning")
+
+                try:
+                    screenshot_path = visual.take_screenshot(f"https://{domain}")
+                    self.results["screenshot"] = screenshot_path
+                    self._log("[+] Screenshot captured", "info")
+                except Exception as exc:
+                    self.results["screenshot"] = None
+                    self._log(f"[-] Screenshot failed: {exc}", "error")
+
+            self.results.update(
+                {
+                    "domain": domain,
+                    "ip": ip,
+                    "profile": profile,
+                    "scan_time": datetime.datetime.now().isoformat(),
+                    "status": "complete",
+                }
             )
-            self.results["network"] = network_result
 
-            web_result = self._safe_run_module(
-                "Web Recon",
-                lambda: web_recon.run(domain, profile=profile),
-            )
-            self.results["web"] = web_result
+            try:
+                report_gen.generate_pdf(self.results, domain)
+                self._log("[+] PDF report generated successfully", "success")
+            except Exception as exc:
+                self._log(f"[-] PDF generation failed: {exc}", "error")
 
-            data_result = self._safe_run_module(
-                "Data Extract",
-                lambda: data_extract.run(domain, ip, profile=profile),
-            )
-            self.results["data"] = data_result
-
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            report_path = os.path.join(
-                OUTPUT_DIR,
-                f"report_{domain}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            )
-            report_result = self._safe_run_module(
-                "Report Generation",
-                lambda: report_gen.generate_report(self.results, domain, report_path),
-            )
-            self.results["report"] = report_result
-
-            visualization_result = self._safe_run_module(
-                "Visualization",
-                lambda: visual.generate_dashboard(self.results, OUTPUT_DIR),
-            )
-            self.results["visual"] = visualization_result
-
-            finish_time = datetime.datetime.now()
-            self.results["metadata"]["finished_at"] = finish_time.isoformat()
-            self.results["metadata"]["duration_seconds"] = round(
-                (finish_time - start_time).total_seconds(),
-                2,
-            )
-
-            self._log(f"Recon completed successfully for {domain}", "done")
+            try:
+                report_gen.generate_csv(self.results, domain)
+                self._log("[+] CSV report generated successfully", "success")
+            except Exception as exc:
+                self._log(f"[-] CSV generation failed: {exc}", "error")
 
         except Exception as exc:
-            self._log(f"Unhandled orchestration failure: {exc}", "error")
-            self.results["error"] = {
-                "message": str(exc),
-                "timestamp": datetime.datetime.now().isoformat(),
-            }
-
+            self.results["status"] = "failed"
+            self.results["error"] = str(exc)
+            self._log(f"[-] Orchestration failure: {exc}", "error")
         finally:
             self.is_running = False
-            self._log(f"Recon workflow finished for {domain}", "status")
+            if self.ui_queue is not None:
+                try:
+                    self.ui_queue.put("[*] DONE")
+                except Exception:
+                    pass
 
-    def _safe_run_module(self, module_name: str, action):
+    def stop_scan(self):
+        self._stop_event.set()
+        self._log("[~] Scan stop requested — finishing current module", "warning")
+
+    def get_results(self) -> dict:
+        return dict(self.results)
+
+
+if __name__ == "__main__":
+    ui_queue = queue.Queue()
+    orchestrator = ReconOrchestrator(ui_queue)
+
+    started = orchestrator.start_scan("google.com", "142.250.190.14", "Quick")
+    print(f"Start result: {started}")
+
+    while orchestrator.is_running or not ui_queue.empty():
         try:
-            result = action()
-            if result is None:
-                result = {"success": True, "message": f"{module_name} completed without explicit output."}
-            if isinstance(result, dict) and "success" not in result:
-                result["success"] = True
-            self._log(f"{module_name} completed successfully.", "info")
-            return result
-        except Exception as exc:
-            self._log(f"{module_name} failed: {exc}", "error")
-            return {"success": False, "error": str(exc), "module": module_name}
+            print(ui_queue.get(timeout=0.5))
+        except queue.Empty:
+            continue
+
+    print("Final results:")
+    print(orchestrator.get_results())
